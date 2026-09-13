@@ -127,6 +127,7 @@ class GigaChatEmbeddings:
         return self.access_token
 
     def embed(self, texts: list[str]) -> np.ndarray:
+        """Request embeddings, retrying only errors which can resolve by themselves."""
         last_error: Exception | None = None
         for attempt in range(7):
             try:
@@ -141,8 +142,21 @@ class GigaChatEmbeddings:
                     timeout=180,
                     verify=False,
                 )
-                if response.status_code == 401:
+                # One fresh token can resolve an expired access token. Repeating
+                # a bad key indefinitely cannot, so fail on the next 401.
+                if response.status_code == 401 and attempt == 0:
                     self.access_token = ""
+                    continue
+
+                # These responses describe a request, access or billing issue.
+                # Retrying them with the same input only stalls the Streamlit
+                # session for several minutes and then produces the same error.
+                if response.status_code in {400, 401, 402, 403, 404, 413, 422}:
+                    detail = response.text.strip().replace("\n", " ")[:500]
+                    raise RuntimeError(
+                        f"GigaChat embeddings request was rejected "
+                        f"({response.status_code}): {detail or response.reason}"
+                    )
                 response.raise_for_status()
                 data = sorted(response.json()["data"], key=lambda item: int(item["index"]))
                 vectors = np.asarray([item["embedding"] for item in data], dtype=np.float32)
@@ -151,9 +165,12 @@ class GigaChatEmbeddings:
                         f"Embedding count mismatch: {vectors.shape[0]} != {len(texts)}"
                     )
                 return vectors
+            except RuntimeError:
+                raise
             except Exception as exc:
                 last_error = exc
-                time.sleep(min(45, 2**attempt))
+                if attempt < 6:
+                    time.sleep(min(45, 2**attempt))
         raise RuntimeError(f"Embedding request failed after retries: {last_error}")
 
 
